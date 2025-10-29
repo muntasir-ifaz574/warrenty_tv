@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.hardware.display.DisplayManager
 import android.os.Build
+import android.util.Log
 import android.os.IBinder
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
@@ -27,6 +28,7 @@ class UsageTrackerService : Service() {
     private var lastScreenOnAtMs: Long? = null
     private var accumulatedActiveMs: Long = 0L
     private var activated: Boolean = false
+    @Volatile private var logging: Boolean = false
 
     private val prefs by lazy {
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -64,6 +66,30 @@ class UsageTrackerService : Service() {
             }
         }
         maybeCompleteIfThresholdReached()
+
+		// Start periodic timer logs (every 10s) until activated
+		logging = true
+		thread(name = "usage-log") {
+			while (logging && !activated) {
+				try {
+					val totalMs = getTotalActiveMs()
+					val minutes = (totalMs / 60000L).toInt()
+					val remaining = ((ACTIVATION_THRESHOLD_MS - totalMs).coerceAtLeast(0L) / 60000L).toInt()
+					Log.d(TAG, "Timer: active=${minutes}m, remaining=${remaining}m")
+					if (totalMs >= ACTIVATION_THRESHOLD_MS && !activated) {
+						Log.d(TAG, "Timer threshold met: totalMs=${totalMs} >= ${ACTIVATION_THRESHOLD_MS}")
+					}
+					// Also trigger activation check periodically so we don't wait for a display change
+					maybeCompleteIfThresholdReached()
+					if (activated) {
+						Log.d(TAG, "Activated flag set after threshold check")
+					}
+					Thread.sleep(10_000L)
+				} catch (_: InterruptedException) {
+					break
+				}
+			}
+		}
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -76,6 +102,7 @@ class UsageTrackerService : Service() {
             displayManager.unregisterDisplayListener(displayListener)
         } catch (_: Exception) {
         }
+        logging = false
         // Persist any in-progress session if screen is currently on
         if (lastScreenOnAtMs != null && isAnyDisplayOn() && !activated) {
             val now = System.currentTimeMillis()
@@ -96,6 +123,7 @@ class UsageTrackerService : Service() {
         if (isAnyDisplayOn()) {
             if (lastScreenOnAtMs == null) {
                 lastScreenOnAtMs = now
+                Log.d(TAG, "Display ON: session started at ${now}")
             }
         } else {
             if (lastScreenOnAtMs != null) {
@@ -103,6 +131,7 @@ class UsageTrackerService : Service() {
                 if (sessionMs > 0) {
                     accumulatedActiveMs += sessionMs
                     prefs.edit().putLong(KEY_ACCUMULATED_MS, accumulatedActiveMs).apply()
+                    Log.d(TAG, "Display OFF: added ${(sessionMs/1000)}s, totalMs=${getTotalActiveMs()}")
                 }
                 lastScreenOnAtMs = null
                 maybeCompleteIfThresholdReached()
@@ -116,11 +145,13 @@ class UsageTrackerService : Service() {
         if (totalMs >= ACTIVATION_THRESHOLD_MS) {
             activated = true
             prefs.edit().putBoolean(KEY_ACTIVATED, true).apply()
+            Log.d(TAG, "Threshold reached: totalMs=${totalMs}")
             sendActivationAsync(totalMs)
         } else {
             val minutes = (totalMs / 60000L).toInt()
             val remaining = ((ACTIVATION_THRESHOLD_MS - totalMs) / 60000L).toInt()
             updateNotification("Active ${minutes}m • ${remaining}m left")
+            Log.d(TAG, "Progress: active=${minutes}m, remaining=${remaining}m")
         }
     }
 
@@ -151,12 +182,14 @@ class UsageTrackerService : Service() {
             }
             if (result) {
                 updateNotification("Warranty activated")
+                Log.d(TAG, "Activation succeeded")
                 stopSelf()
             } else {
                 // Mark not activated to retry later
                 prefs.edit().putBoolean(KEY_ACTIVATED, false).apply()
                 activated = false
                 updateNotification("Activation failed, will retry")
+                Log.w(TAG, "Activation failed; will retry later")
             }
         }
     }
@@ -184,6 +217,7 @@ class UsageTrackerService : Service() {
             doInput = true
             doOutput = true
             useCaches = false
+            instanceFollowRedirects = true
             setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
         }
 
@@ -209,6 +243,16 @@ class UsageTrackerService : Service() {
             }
 
             val code = connection.responseCode
+            val msg = connection.responseMessage
+            Log.d(TAG, "HTTP response: code=${code}, message=${msg}")
+            if (code !in 200..299) {
+                try {
+                    val err = connection.errorStream?.bufferedReader()?.use { it.readText() }
+                    if (!err.isNullOrBlank()) {
+                        Log.w(TAG, "HTTP error body: ${err}")
+                    }
+                } catch (_: Throwable) {}
+            }
             return code in 200..299
         } finally {
             connection.disconnect()
@@ -251,6 +295,7 @@ class UsageTrackerService : Service() {
     }
 
     companion object {
+        private const val TAG = "UsageTrackerService"
         private const val PREFS_NAME = "warranty_prefs"
         private const val KEY_ACCUMULATED_MS = "accumulated_ms"
         private const val KEY_ACTIVATED = "activated"
@@ -258,7 +303,7 @@ class UsageTrackerService : Service() {
         private const val NOTIFICATION_CHANNEL_ID = "warranty_channel"
         private const val NOTIFICATION_ID = 1001
 
-        private const val ACTIVATION_THRESHOLD_MS = 30L * 60L * 1000L // 30 minutes
+        private const val ACTIVATION_THRESHOLD_MS = 5L * 60L * 1000L // 5 minutes
 
         // TODO: Replace with your server endpoint
         private const val ACTIVATION_ENDPOINT = "https://warrenty-server.vercel.app/api/activate"
