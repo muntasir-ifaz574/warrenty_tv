@@ -1,0 +1,4 @@
+<resources>
+
+    <style name="Theme.Warrantyactivator" parent="@style/Theme.Leanback" />
+</resources>
